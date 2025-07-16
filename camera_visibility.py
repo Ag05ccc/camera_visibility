@@ -1,87 +1,178 @@
+
+from __future__ import annotations
+import math
+from dataclasses import dataclass
+from typing import Tuple
 import numpy as np
-from math import sin, cos, atan2, sqrt, radians
 
+# Spherical Earth radius (m)
+R_EARTH = 6378137.0
+
+# -----------------------------------------------------------------------------
+# Utility conversions
+# -----------------------------------------------------------------------------
+
+def deg2rad(d: float) -> float:
+    return math.radians(d)
+
+
+def rad2deg(r: float) -> float:
+    return math.degrees(r)
+
+
+def latlonalt_to_ecef(lat_deg: float, lon_deg: float, alt_m: float) -> np.ndarray:
+    """Convert geodetic (spherical approx) to ECEF XYZ (meters)."""
+    lat = deg2rad(lat_deg)
+    lon = deg2rad(lon_deg)
+    r = R_EARTH + alt_m
+    x = r * math.cos(lat) * math.cos(lon)
+    y = r * math.cos(lat) * math.sin(lon)
+    z = r * math.sin(lat)
+    return np.array([x, y, z], dtype=float)
+
+
+def enu_axes(lat_deg: float, lon_deg: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return local unit vectors (East, North, Up) in ECEF coords at lat/lon."""
+    lat = deg2rad(lat_deg)
+    lon = deg2rad(lon_deg)
+    # Up
+    up = np.array([
+        math.cos(lat) * math.cos(lon),
+        math.cos(lat) * math.sin(lon),
+        math.sin(lat),
+    ], dtype=float)
+    # East = d/dlon normalized
+    east = np.array([-math.sin(lon), math.cos(lon), 0.0], dtype=float)
+    # North = Up × East?  Actually, we want orthonormal: north = np.cross(up, east)
+    north = np.cross(up, east)
+    # Normalize
+    east /= np.linalg.norm(east)
+    north /= np.linalg.norm(north)
+    up /= np.linalg.norm(up)
+    return east, north, up
+
+
+def rodrigues_rotate(v: np.ndarray, axis: np.ndarray, angle_rad: float) -> np.ndarray:
+    """Rotate vector *v* about unit *axis* by angle (rad)."""
+    axis = axis / np.linalg.norm(axis)
+    v = np.asarray(v, dtype=float)
+    c = math.cos(angle_rad)
+    s = math.sin(angle_rad)
+    return v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1 - c)
+
+
+@dataclass
 class CameraVisibility:
-    """Check whether a ground point is in the camera’s FOV."""
+    lat: float
+    lon: float
+    alt: float
+    yaw_deg: float
+    pitch_deg: float
+    roll_deg: float
+    fov_h_deg: float
+    fov_v_deg: float
 
-    # ───────────────────────────────────────────────────────────── WGS‑84 constants
-    _a = 6_378_137.0             # semi‑major axis  [m]
-    _f = 1 / 298.257223563
-    _b = _a * (1 - _f)
-    _e2 = _f * (2 - _f)
+    def _camera_basis_in_enu(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Compute camera Forward/Right/Up unit vectors expressed in **ENU**.
 
-    # ──────────────────────────────────────────────────────────── basic conversions
-    @staticmethod
-    def _geodetic_to_ecef(lat_deg, lon_deg, h):
-        lat, lon = map(radians, (lat_deg, lon_deg))
-        N = CameraVisibility._a / sqrt(1 - CameraVisibility._e2 * sin(lat)**2)
-        x = (N + h) * cos(lat) * cos(lon)
-        y = (N + h) * cos(lat) * sin(lon)
-        z = (N * (1 - CameraVisibility._e2) + h) * sin(lat)
-        return np.array([x, y, z])
+        Conventions:
+        - Forward (optical axis) = East when yaw=pitch=roll=0.
+        - Yaw rotates about *Up* (+CCW East→North).
+        - Pitch rotates about *Right* (+nose up).
+        - Roll rotates about *Forward* (+right‑wing‑down).
+        """
+        east, north, up = enu_axes(self.lat, self.lon)
+        fwd = east.copy()
+        right = np.cross(fwd, up); right /= np.linalg.norm(right)  # roughly South when yaw=0
+        up_c = up.copy()
 
-    @staticmethod
-    def _ecef_to_enu(ecef, lat0_deg, lon0_deg, h0):
-        """Return ENU vector from camera to target."""
-        lat0, lon0 = map(radians, (lat0_deg, lon0_deg))
-        x0, y0, z0 = CameraVisibility._geodetic_to_ecef(lat0_deg, lon0_deg, h0)
-        dx, dy, dz = ecef - np.array([x0, y0, z0])
-        e = -sin(lon0) * dx +  cos(lon0) * dy
-        n = -sin(lat0) * cos(lon0) * dx - sin(lat0) * sin(lon0) * dy + cos(lat0) * dz
-        u =  cos(lat0) * cos(lon0) * dx + cos(lat0) * sin(lon0) * dy + sin(lat0) * dz
-        return np.array([e, n, u])
+        # Yaw about Up
+        if self.yaw_deg:
+            ang = deg2rad(self.yaw_deg)
+            fwd = rodrigues_rotate(fwd, up_c, ang)
+            right = rodrigues_rotate(right, up_c, ang)
+            # up_c unchanged
 
-    @staticmethod
-    def _enu_to_camera(v_enu, yaw_deg, pitch_deg, roll_deg):
-        """Rotate ENU vector into the camera body frame (+X forward, +Y right, +Z down)."""
-        ya, pi, ro = map(radians, (yaw_deg, pitch_deg, roll_deg))
+        # Pitch about Right (nose up positive -> rotate Forward toward Up)
+        if self.pitch_deg:
+            ang = deg2rad(self.pitch_deg)
+            fwd = rodrigues_rotate(fwd, right, ang)
+            up_c = rodrigues_rotate(up_c, right, ang)
+            # right unchanged
 
-        R_yaw   = np.array([[ cos(ya), sin(ya), 0],
-                            [-sin(ya), cos(ya), 0],
-                            [       0,       0, 1]])
+        # Roll about Forward (right‑wing‑down positive rotates Up toward Right)
+        if self.roll_deg:
+            ang = deg2rad(self.roll_deg)
+            right = rodrigues_rotate(right, fwd, ang)
+            up_c = rodrigues_rotate(up_c, fwd, ang)
+            # fwd unchanged
 
-        R_pitch = np.array([[ cos(pi), 0, -sin(pi)],
-                            [       0, 1,        0],
-                            [ sin(pi), 0,  cos(pi)]])
+        # Re‑orthonormalize (drift protection)
+        fwd /= np.linalg.norm(fwd)
+        right -= fwd * np.dot(fwd, right); right /= np.linalg.norm(right)
+        up_c = np.cross(fwd, right); up_c /= np.linalg.norm(up_c)
+        return fwd, right, up_c
 
-        R_roll  = np.array([[1,        0,         0],
-                            [0,  cos(ro),  sin(ro)],
-                            [0, -sin(ro),  cos(ro)]])
+    # ------------------------------------------------------------------
+    # Core visibility check
+    # ------------------------------------------------------------------
+    def can_see(self, tgt_lat: float, tgt_lon: float, tgt_alt: float) -> bool:
+        """Return True if target lies within camera FOV (no range limits)."""
+        cam_ecef = latlonalt_to_ecef(self.lat, self.lon, self.alt)
+        tgt_ecef = latlonalt_to_ecef(tgt_lat, tgt_lon, tgt_alt)
+        vec = tgt_ecef - cam_ecef
+        # Express in ENU
+        east, north, up = enu_axes(self.lat, self.lon)
+        enu_mat = np.vstack([east, north, up]).T  # columns
+        vec_enu = enu_mat.T @ vec  # coords in ENU frame
 
-        return R_roll @ R_pitch @ R_yaw @ v_enu
+        # Camera basis in ENU
+        fwd, right, up_c = self._camera_basis_in_enu()
+        cam_mat = np.vstack([fwd, right, up_c]).T
+        # ENU -> Camera
+        # (cam_mat columns are cam axes in ENU, so inverse = transpose)
+        vec_cam = cam_mat.T @ (enu_mat @ vec_enu)  # Wait, we double transform? simplify below
+        # Actually we already have vec_enu (coords). To express in camera: dot with axes
+        vec_cam = np.array([
+            np.dot(vec_enu, fwd),
+            np.dot(vec_enu, right),
+            np.dot(vec_enu, up_c),
+        ])
 
-    # ───────────────────────────────────────────────────────────────────── interface
-    def __init__(self, lat, lon, alt,
-                 yaw_deg, pitch_deg, roll_deg,
-                 fov_h_deg, fov_v_deg):
-        self.lat, self.lon, self.alt = lat, lon, alt
-        self.yaw, self.pitch, self.roll = yaw_deg, pitch_deg, roll_deg
-        self.fov_h = radians(fov_h_deg)
-        self.fov_v = radians(fov_v_deg)
-
-    def can_see(self, tgt_lat, tgt_lon, tgt_alt=0.0):
-        """Return True if P₁ is inside the FOV rectangle."""
-        ecef_tgt = self._geodetic_to_ecef(tgt_lat, tgt_lon, tgt_alt)
-        v_enu    = self._ecef_to_enu(ecef_tgt, self.lat, self.lon, self.alt)
-        v_cam    = self._enu_to_camera(v_enu,
-                                       self.yaw, self.pitch, self.roll)
-
-        # If target is behind the sensor (x ≤ 0) it is invisible
-        if v_cam[0] <= 0:
+        if vec_cam[0] <= 0:  # behind forward axis
             return False
 
-        # Angular deviation from optical axis
-        az   = atan2(v_cam[1], v_cam[0])            # horizontal (rad)
-        el   = atan2(-v_cam[2], sqrt(v_cam[0]**2 + v_cam[1]**2))  # vertical (rad)
+        # Horizontal / vertical angles
+        horiz_ang = math.degrees(math.atan2(vec_cam[1], vec_cam[0]))  # right vs forward
+        vert_ang = math.degrees(math.atan2(vec_cam[2], math.hypot(vec_cam[0], vec_cam[1])))
+        return (abs(horiz_ang) <= self.fov_h_deg * 0.5) and (abs(vert_ang) <= self.fov_v_deg * 0.5)
 
-        return (abs(az) <= self.fov_h / 2) and (abs(el) <= self.fov_v / 2)
+    # ------------------------------------------------------------------
+    # Convenience: get camera frustum corner rays in ECEF for plotting.
+    # ------------------------------------------------------------------
+    def frustum_rays_ecef(self, range_m: float) -> np.ndarray:
+        """Return 4 ECEF points reached by the frustum edge rays at *range_m*.
 
-# ───────────────────────────────────────────────────────────── usage example
-if __name__ == "__main__":
-    cam = CameraVisibility(
-        lat=40.00000, lon=29.00000, alt=100.0,   # camera position (m)
-        yaw_deg= 30.0, pitch_deg=-10.0, roll_deg=0.0,
-        fov_h_deg=60.0, fov_v_deg=40.0)
-
-    print("Target visible:",
-          cam.can_see(40.0008, 29.0007, 10.0))     # → True / False
+        Order: [top‑left, top‑right, bottom‑right, bottom‑left]."""
+        cam_ecef = latlonalt_to_ecef(self.lat, self.lon, self.alt)
+        fwd, right, up_c = self._camera_basis_in_enu()
+        # Express basis in ECEF directly: fwd, right, up_c are in ECEF already.
+        # Build direction vectors for each corner.
+        h = math.tan(deg2rad(self.fov_h_deg * 0.5))
+        v = math.tan(deg2rad(self.fov_v_deg * 0.5))
+        # directions in camera frame: (1, ±h, ±v) normalized
+        dirs_cam = np.array([
+            [1.0, -h,  v],  # TL (image coordinates x right, y up) -> choose consistent
+            [1.0,  h,  v],  # TR
+            [1.0,  h, -v],  # BR
+            [1.0, -h, -v],  # BL
+        ])
+        # Build camera matrix columns = fwd, right, up_c
+        C = np.column_stack([fwd, right, up_c])  # ECEFx3
+        pts = []
+        for d in dirs_cam:
+            d_norm = d / np.linalg.norm(d)
+            # Map to ECEF: d_world = C @ [fwd, right, up] coords
+            d_world = C @ d_norm
+            pts.append(cam_ecef + d_world * range_m)
+        return np.array(pts)
