@@ -81,10 +81,17 @@ class CameraVisibility:
         - Pitch rotates about *Right* (+nose up).
         - Roll rotates about *Forward* (+right‑wing‑down).
         """
+        # east, north, up = enu_axes(self.lat, self.lon)
+        # fwd = east.copy()
+        # right = np.cross(fwd, up); right /= np.linalg.norm(right)  # roughly South when yaw=0
+        # up_c = up.copy()
+
         east, north, up = enu_axes(self.lat, self.lon)
-        fwd = east.copy()
-        right = np.cross(fwd, up); right /= np.linalg.norm(right)  # roughly South when yaw=0
-        up_c = up.copy()
+
+        # PX4 forward = body X axis = ENU North
+        fwd = north.copy()
+        right = east.copy()         # PX4 right = body Y = ENU East
+        up_c = up.copy()            # PX4 up = body Z = ENU Up
 
         # Yaw about Up
         if self.yaw_deg:
